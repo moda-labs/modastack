@@ -10,6 +10,8 @@ a real manager locally. The same stub brain drives the private sidecar e2e.
 
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -191,6 +193,54 @@ class TestManagerStartStop:
         _wait_for_exit_file(pid_file)
 
 
+@pytest.mark.timeout(120)
+def test_restart_completes_when_caller_dies(stub_bobi_env, stub_cli_run):
+    pid_file = stub_bobi_env.state_dir / "manager.pid"
+    caller = None
+    try:
+        started = stub_cli_run("start", timeout=45)
+        assert started.returncode == 0, started.stderr
+        old_pid = _wait_for_pid(pid_file)
+
+        caller_env = {
+            **os.environ,
+            "BOBI_HOME": str(stub_bobi_env.home_dir),
+            "BOBI_EVENT_SERVER": stub_bobi_env.event_server_url,
+            "BOBI_BRAIN": "stub",
+            "BOBI_STUB_BRAIN": "1",
+        }
+        caller = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "bobi.cli",
+                "agent",
+                stub_bobi_env.agent_name,
+                "restart",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(stub_bobi_env.project_path),
+            env=caller_env,
+        )
+
+        assert _kill_caller_when_manager_stops(caller, pid_file, old_pid), (
+            "restart caller exited before the manager stopped"
+        )
+        new_pid = _wait_for_pid(pid_file, timeout=60, other_than=old_pid)
+        os.kill(new_pid, 0)
+
+        record = (stub_bobi_env.state_dir / "restart.log").read_text()
+        assert "Restart worker finished." in record
+    finally:
+        if caller is not None and caller.poll() is None:
+            caller.kill()
+            caller.wait(timeout=10)
+        stub_cli_run("stop", timeout=30)
+        _wait_for_exit_file(pid_file)
+
+
 @pytest.mark.timeout(180)
 class TestManagerMessaging:
     """Tests that require a fully booted manager with drain loop active."""
@@ -271,6 +321,40 @@ class TestManagerNotRunning:
 
         result = cli_run("ask", "should fail", timeout=5)
         assert result.returncode != 0
+
+
+def _wait_for_pid(pid_file, timeout: float = 15, other_than: int = 0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+        except (ValueError, OSError, ProcessLookupError):
+            pid = 0
+        if pid and pid != other_than:
+            return pid
+        time.sleep(0.1)
+    raise TimeoutError(f"{pid_file} never held a live pid other than {other_than}")
+
+
+def _kill_caller_when_manager_stops(proc, pid_file, old_pid: int,
+                                    timeout: float = 30) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            current_pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            current_pid = 0
+        if current_pid != old_pid:
+            if proc.poll() is not None:
+                return False
+            proc.kill()
+            proc.wait(timeout=10)
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.05)
+    raise TimeoutError(f"manager pid file never changed from {old_pid}")
 
 
 def _wait_for_exit(pid: int, timeout: float = 10):

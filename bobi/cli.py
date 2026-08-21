@@ -937,13 +937,22 @@ def stop(force):
 
 @main.command()
 @click.option("--fresh", is_flag=True, help="Wipe manager session and start clean")
-def restart(fresh):
+@click.option("--detached-worker", is_flag=True, hidden=True)
+def restart(fresh, detached_worker):
     """Stop and restart the selected Bobi Agent.
 
     Usage:
         bobi agent eng restart
         bobi agent eng restart --fresh   # fresh manager session
     """
+    if detached_worker:
+        ctx = click.get_current_context()
+        click.echo(logs.stamped("INFO", f"Restart worker pid {os.getpid()} starting."))
+        ctx.invoke(stop)
+        ctx.invoke(start, fresh=fresh)
+        click.echo(logs.stamped("INFO", "Restart worker finished."))
+        return
+
     if _has_systemd_service():
         # Resolve before touching systemd so a missing installation fails
         # here, not after the service has already been restarted.
@@ -968,9 +977,16 @@ def restart(fresh):
         click.echo(f"Bobi restarted (pid {pid}). Logs: {log_path}")
         return
 
-    ctx = click.get_current_context()
-    ctx.invoke(stop)
-    ctx.invoke(start, fresh=fresh)
+    from bobi.service import RestartFailed, restart_team
+
+    project_path = _detect_project_root()
+    try:
+        result = restart_team(project_path, fresh=fresh)
+    except RestartFailed as exc:
+        click.echo(exc.report(), err=True)
+        raise SystemExit(1)
+    if result.output:
+        click.echo(result.output, nl=not result.output.endswith("\n"))
 
 
 def _resolve_address(to: str | None) -> str | None:

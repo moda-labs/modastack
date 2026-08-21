@@ -80,7 +80,7 @@ bobi build <team> --tag <ref> [--push]  # render a team into a ready-to-run
 ```bash
 bobi agent <name> start
 bobi agent <name> stop
-bobi agent <name> restart
+bobi agent <name> restart      # safe to run from inside the runtime
 bobi agent <name> start --fresh
 bobi agent <name> status
 bobi agent <name> doctor
@@ -125,6 +125,11 @@ bobi read-conversation <conversation> [-n 50] [--json-output]
 
 Use `bobi reply` and `bobi read-conversation` for Slack and any other
 chat channel delivered through the channel gateway.
+
+`restart` hands its stop and start phases to a detached worker. The restart
+therefore completes even when stopping the manager also kills the process that
+requested it. The latest worker record is kept in
+`~/.bobi/agents/<name>/run/state/restart.log` for diagnosis.
 
 ## Upgrading Bobi In Place
 

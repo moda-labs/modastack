@@ -4,6 +4,7 @@ calls and read a real (temp) BOBI_HOME via the bobi_install fixture;
 TestMultiAgentRealService runs the real service layer on purpose (#706)."""
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -905,17 +906,38 @@ class TestLifecycle:
         assert r.json()["ok"] is True
 
     def test_restart(self, bobi_install, monkeypatch):
-        calls = []
+        seen = {}
+
+        def fake_restart(root, **kwargs):
+            seen["root"] = root
+            return service.RestartResult(pid=4242, log_file=Path("restart.log"))
+
+        monkeypatch.setattr(service, "restart_team", fake_restart)
         monkeypatch.setattr(
-            service, "stop_team",
-            lambda root, **kw: calls.append("stop")
-            or service.StopResult(pid=42, stopped=True))
-        monkeypatch.setattr(
-            service, "spawn_team",
-            lambda root, **kw: calls.append("spawn") or _FakeSpawn())
+            service,
+            "stop_team",
+            lambda *args, **kwargs: pytest.fail("restart stopped in web caller"),
+        )
         r = _client().post(f"/api/agents/{bobi_install.agent_name}/restart")
         assert r.status_code == 200
-        assert calls == ["stop", "spawn"]
+        assert r.json() == {"ok": True, "pid": 4242}
+        assert seen["root"] == bobi_install.repo_path
+
+    def test_restart_failure_reports_worker_log(self, bobi_install, monkeypatch):
+        def fail_restart(root, **kwargs):
+            raise service.RestartFailed(
+                "restart failed (worker exit 1)",
+                Path("restart.log"),
+                "missing SLACK_BOT_TOKEN",
+            )
+
+        monkeypatch.setattr(service, "restart_team", fail_restart)
+
+        r = _client().post(f"/api/agents/{bobi_install.agent_name}/restart")
+
+        assert r.status_code == 409
+        assert "restart.log" in r.json()["error"]
+        assert "missing SLACK_BOT_TOKEN" in r.json()["error"]
 
 
 class TestMultiAgentRealService:
