@@ -200,10 +200,17 @@ def test_restart_completes_when_caller_process_group_dies(
     pid_file = stub_bobi_env.state_dir / "manager.pid"
     restart_log = stub_bobi_env.state_dir / "restart.log"
     caller = None
+    old_manager_paused = False
     try:
         started = stub_cli_run("start", timeout=45)
         assert started.returncode == 0, started.stderr
         old_pid = _wait_for_pid(pid_file)
+
+        # Hold the old manager so the worker remains inside stop_team long
+        # enough for the test to inspect its process group deterministically.
+        os.kill(old_pid, signal.SIGSTOP)
+        old_manager_paused = True
+        restart_log.unlink(missing_ok=True)
 
         caller_env = {
             **os.environ,
@@ -230,12 +237,19 @@ def test_restart_completes_when_caller_process_group_dies(
         )
 
         _kill_caller_group_after_worker_starts(caller, restart_log)
+        os.kill(old_pid, signal.SIGCONT)
+        old_manager_paused = False
         new_pid = _wait_for_pid(pid_file, timeout=60, other_than=old_pid)
         os.kill(new_pid, 0)
 
         record = restart_log.read_text()
         assert "Restart worker finished." in record
     finally:
+        if old_manager_paused:
+            try:
+                os.kill(old_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
         if caller is not None and caller.poll() is None:
             os.killpg(caller.pid, signal.SIGKILL)
             caller.wait(timeout=10)
@@ -352,18 +366,11 @@ def _kill_caller_group_after_worker_starts(proc, restart_log,
         if line:
             assert proc.poll() is None, "restart caller exited before group kill"
             worker_pid = int(line.split(marker, 1)[1].split()[0])
-            os.kill(worker_pid, signal.SIGSTOP)
-            try:
-                assert os.getpgid(worker_pid) != os.getpgid(proc.pid), (
-                    "restart worker stayed in caller process group"
-                )
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=10)
-            finally:
-                try:
-                    os.kill(worker_pid, signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
+            assert os.getpgid(worker_pid) != os.getpgid(proc.pid), (
+                "restart worker stayed in caller process group"
+            )
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
             return
         if proc.poll() is not None:
             raise AssertionError("restart caller exited before worker started")
