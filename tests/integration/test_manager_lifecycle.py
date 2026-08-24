@@ -194,8 +194,11 @@ class TestManagerStartStop:
 
 
 @pytest.mark.timeout(120)
-def test_restart_completes_when_caller_dies(stub_bobi_env, stub_cli_run):
+def test_restart_completes_when_caller_process_group_dies(
+    stub_bobi_env, stub_cli_run
+):
     pid_file = stub_bobi_env.state_dir / "manager.pid"
+    restart_log = stub_bobi_env.state_dir / "restart.log"
     caller = None
     try:
         started = stub_cli_run("start", timeout=45)
@@ -223,19 +226,18 @@ def test_restart_completes_when_caller_dies(stub_bobi_env, stub_cli_run):
             text=True,
             cwd=str(stub_bobi_env.project_path),
             env=caller_env,
+            start_new_session=True,
         )
 
-        assert _kill_caller_when_manager_stops(caller, pid_file, old_pid), (
-            "restart caller exited before the manager stopped"
-        )
+        _kill_caller_group_after_worker_starts(caller, restart_log)
         new_pid = _wait_for_pid(pid_file, timeout=60, other_than=old_pid)
         os.kill(new_pid, 0)
 
-        record = (stub_bobi_env.state_dir / "restart.log").read_text()
+        record = restart_log.read_text()
         assert "Restart worker finished." in record
     finally:
         if caller is not None and caller.poll() is None:
-            caller.kill()
+            os.killpg(caller.pid, signal.SIGKILL)
             caller.wait(timeout=10)
         stub_cli_run("stop", timeout=30)
         _wait_for_exit_file(pid_file)
@@ -337,24 +339,36 @@ def _wait_for_pid(pid_file, timeout: float = 15, other_than: int = 0) -> int:
     raise TimeoutError(f"{pid_file} never held a live pid other than {other_than}")
 
 
-def _kill_caller_when_manager_stops(proc, pid_file, old_pid: int,
-                                    timeout: float = 30) -> bool:
+def _kill_caller_group_after_worker_starts(proc, restart_log,
+                                           timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            current_pid = int(pid_file.read_text().strip())
-        except (ValueError, OSError):
-            current_pid = 0
-        if current_pid != old_pid:
-            if proc.poll() is not None:
-                return False
-            proc.kill()
-            proc.wait(timeout=10)
-            return True
+            record = restart_log.read_text()
+        except OSError:
+            record = ""
+        marker = "Restart worker pid "
+        line = next((line for line in record.splitlines() if marker in line), "")
+        if line:
+            assert proc.poll() is None, "restart caller exited before group kill"
+            worker_pid = int(line.split(marker, 1)[1].split()[0])
+            os.kill(worker_pid, signal.SIGSTOP)
+            try:
+                assert os.getpgid(worker_pid) != os.getpgid(proc.pid), (
+                    "restart worker stayed in caller process group"
+                )
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
+            finally:
+                try:
+                    os.kill(worker_pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            return
         if proc.poll() is not None:
-            return False
+            raise AssertionError("restart caller exited before worker started")
         time.sleep(0.05)
-    raise TimeoutError(f"manager pid file never changed from {old_pid}")
+    raise TimeoutError("detached restart worker never started")
 
 
 def _wait_for_exit(pid: int, timeout: float = 10):
