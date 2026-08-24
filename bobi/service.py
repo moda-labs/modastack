@@ -19,6 +19,9 @@ from bobi.sdk import SessionEntry
 
 log = logging.getLogger(__name__)
 
+RESTART_TIMEOUT = 180.0
+MANAGER_PID_TIMEOUT = 30.0
+
 
 class ServiceError(Exception):
     """Base class for service-core failures."""
@@ -72,6 +75,16 @@ class MessageDeliveryError(ServiceError):
         super().__init__(message)
 
 
+class RestartFailed(ServiceError):
+    def __init__(self, reason: str, log_file: Path, log_tail: str = "") -> None:
+        super().__init__(f"{reason} (see {log_file})")
+        self.log_file = Path(log_file)
+        self.log_tail = log_tail
+
+    def report(self) -> str:
+        return f"{self}\n{self.log_tail}" if self.log_tail else str(self)
+
+
 @dataclass(frozen=True)
 class StartupInfo:
     version: str
@@ -94,6 +107,20 @@ class SpawnResult:
     validation: object
     image_rotated: bool = False
     process: subprocess.Popen | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class RestartHandle:
+    pid: int
+    log_file: Path
+    process: subprocess.Popen = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class RestartResult:
+    pid: int
+    log_file: Path
+    output: str = ""
 
 
 @dataclass(frozen=True)
@@ -337,6 +364,17 @@ def _wait_for_manager_transport(
     raise TransportReadyTimeout(manager_name, timeout)
 
 
+def _cli_child_env(project_path: Path) -> dict[str, str]:
+    from bobi.env import child_agent_env
+
+    env = child_agent_env(project_path)
+    venv_bin = str(Path(sys.executable).parent)
+    local_bin = str(Path.home() / ".local" / "bin")
+    env["PATH"] = f"{venv_bin}:{local_bin}:{env.get('PATH', '')}"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
 def spawn_team(
     project_path: Path,
     *,
@@ -374,12 +412,7 @@ def spawn_team(
         )
 
     log_file = paths.manager_log_path(project_path)
-    from bobi.env import child_agent_env
-    env = child_agent_env(project_path)
-    venv_bin = str(Path(sys.executable).parent)
-    local_bin = str(Path.home() / ".local" / "bin")
-    env["PATH"] = f"{venv_bin}:{local_bin}:{env.get('PATH', '')}"
-    env["PYTHONUNBUFFERED"] = "1"
+    env = _cli_child_env(project_path)
     cmd = [
         sys.executable,
         "-m",
@@ -723,6 +756,103 @@ def stop_team(project_path: Path, *, force: bool = False) -> StopResult:
     return StopResult(**result_kwargs)
 
 
+def spawn_restart(project_path: Path, *, fresh: bool = False) -> RestartHandle:
+    """Detach the stop+start owner before it enters the manager's process tree."""
+    project_path = Path(project_path)
+    log_file = paths.restart_log_path(project_path)
+    cmd = [
+        sys.executable,
+        "-m",
+        "bobi.cli",
+        "agent",
+        paths.agent_name_for_root(project_path),
+        "restart",
+        "--detached-worker",
+    ]
+    if fresh:
+        cmd.append("--fresh")
+
+    with open(log_file, "w") as output:
+        process = subprocess.Popen(
+            cmd,
+            stdout=output,
+            stderr=output,
+            cwd=str(project_path),
+            env=_cli_child_env(project_path),
+            start_new_session=True,
+        )
+    return RestartHandle(process.pid, log_file, process)
+
+
+def restart_team(
+    project_path: Path,
+    *,
+    fresh: bool = False,
+    timeout: float = RESTART_TIMEOUT,
+) -> RestartResult:
+    """Restart through a detached worker that survives its caller."""
+    project_path = Path(project_path)
+    pid_path = paths.manager_pid_path(project_path)
+    previous_pid = _read_pid(pid_path)
+    handle = spawn_restart(project_path, fresh=fresh)
+
+    try:
+        code = handle.process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RestartFailed(
+            f"restart is still running as pid {handle.pid} after {timeout:g}s",
+            handle.log_file,
+            _log_tail(handle.log_file),
+        ) from exc
+
+    output = _read_restart_log(handle.log_file)
+    if code != 0:
+        raise RestartFailed(
+            f"restart failed (worker exit {code})",
+            handle.log_file,
+            _log_tail(handle.log_file),
+        )
+
+    pid = _wait_for_manager_pid(
+        pid_path,
+        timeout=MANAGER_PID_TIMEOUT,
+        other_than=previous_pid,
+    )
+    if not pid:
+        if previous_pid and _pid_alive(previous_pid):
+            reason = f"restart left manager pid {previous_pid} running"
+        else:
+            reason = "restart finished but no manager is running"
+        raise RestartFailed(reason, handle.log_file, _log_tail(handle.log_file))
+    return RestartResult(pid=pid, log_file=handle.log_file, output=output)
+
+
+def _wait_for_manager_pid(
+    pid_path: Path,
+    *,
+    timeout: float,
+    other_than: int = 0,
+) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pid = _read_pid(pid_path)
+        if pid and pid != other_than and _pid_alive(pid):
+            return pid
+        time.sleep(0.1)
+    return 0
+
+
+def _read_restart_log(log_file: Path) -> str:
+    try:
+        return log_file.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _log_tail(log_file: Path, lines: int = 40) -> str:
+    return "\n".join(_read_restart_log(log_file).splitlines()[-lines:])
+
+
 def team_status(project_path: Path) -> TeamStatus:
     """Return manager and active-agent status without formatting."""
     project_path = Path(project_path)
@@ -815,5 +945,4 @@ def ask(
     append_chat(project_path, agent, "user", text)
     append_chat(project_path, agent, "agent", result.response)
     return result
-
 

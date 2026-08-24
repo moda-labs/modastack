@@ -422,6 +422,10 @@ Work through these in order:
    bobi agent my-agent restart
    ```
 
+   Restart uses a detached worker, so it can complete when requested from
+   inside the runtime. Its latest record is stored at
+   `~/.bobi/agents/<name>/run/state/restart.log`.
+
 4. **Start fresh.** If a session is wedged, wipe it and start clean (your
    workspace files and credentials are kept):
 

@@ -10,6 +10,8 @@ a real manager locally. The same stub brain drives the private sidecar e2e.
 
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -191,6 +193,70 @@ class TestManagerStartStop:
         _wait_for_exit_file(pid_file)
 
 
+@pytest.mark.timeout(120)
+def test_restart_completes_when_caller_process_group_dies(
+    stub_bobi_env, stub_cli_run
+):
+    pid_file = stub_bobi_env.state_dir / "manager.pid"
+    restart_log = stub_bobi_env.state_dir / "restart.log"
+    caller = None
+    old_manager_paused = False
+    try:
+        started = stub_cli_run("start", timeout=45)
+        assert started.returncode == 0, started.stderr
+        old_pid = _wait_for_pid(pid_file)
+
+        # Hold the old manager so the worker remains inside stop_team long
+        # enough for the test to inspect its process group deterministically.
+        os.kill(old_pid, signal.SIGSTOP)
+        old_manager_paused = True
+        restart_log.unlink(missing_ok=True)
+
+        caller_env = {
+            **os.environ,
+            "BOBI_HOME": str(stub_bobi_env.home_dir),
+            "BOBI_EVENT_SERVER": stub_bobi_env.event_server_url,
+            "BOBI_BRAIN": "stub",
+            "BOBI_STUB_BRAIN": "1",
+        }
+        caller = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "bobi.cli",
+                "agent",
+                stub_bobi_env.agent_name,
+                "restart",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(stub_bobi_env.project_path),
+            env=caller_env,
+            start_new_session=True,
+        )
+
+        _kill_caller_group_after_worker_starts(caller, restart_log)
+        os.kill(old_pid, signal.SIGCONT)
+        old_manager_paused = False
+        new_pid = _wait_for_pid(pid_file, timeout=60, other_than=old_pid)
+        os.kill(new_pid, 0)
+
+        record = restart_log.read_text()
+        assert "Restart worker finished." in record
+    finally:
+        if old_manager_paused:
+            try:
+                os.kill(old_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        if caller is not None and caller.poll() is None:
+            os.killpg(caller.pid, signal.SIGKILL)
+            caller.wait(timeout=10)
+        stub_cli_run("stop", timeout=30)
+        _wait_for_exit_file(pid_file)
+
+
 @pytest.mark.timeout(180)
 class TestManagerMessaging:
     """Tests that require a fully booted manager with drain loop active."""
@@ -271,6 +337,45 @@ class TestManagerNotRunning:
 
         result = cli_run("ask", "should fail", timeout=5)
         assert result.returncode != 0
+
+
+def _wait_for_pid(pid_file, timeout: float = 15, other_than: int = 0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+        except (ValueError, OSError, ProcessLookupError):
+            pid = 0
+        if pid and pid != other_than:
+            return pid
+        time.sleep(0.1)
+    raise TimeoutError(f"{pid_file} never held a live pid other than {other_than}")
+
+
+def _kill_caller_group_after_worker_starts(proc, restart_log,
+                                           timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            record = restart_log.read_text()
+        except OSError:
+            record = ""
+        marker = "Restart worker pid "
+        line = next((line for line in record.splitlines() if marker in line), "")
+        if line:
+            assert proc.poll() is None, "restart caller exited before group kill"
+            worker_pid = int(line.split(marker, 1)[1].split()[0])
+            assert os.getpgid(worker_pid) != os.getpgid(proc.pid), (
+                "restart worker stayed in caller process group"
+            )
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+            return
+        if proc.poll() is not None:
+            raise AssertionError("restart caller exited before worker started")
+        time.sleep(0.05)
+    raise TimeoutError("detached restart worker never started")
 
 
 def _wait_for_exit(pid: int, timeout: float = 10):
