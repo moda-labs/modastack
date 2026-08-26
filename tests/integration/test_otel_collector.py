@@ -140,7 +140,8 @@ class _Collector:
             self.proc.kill()
 
 
-def _await_ready(endpoint: str, proc: subprocess.Popen, timeout: float = 60.0) -> None:
+def _await_ready(endpoint: str, proc: subprocess.Popen, log: Path,
+                 timeout: float = 60.0) -> None:
     """Ready = the OTLP receiver ANSWERS. A TCP connect proves the wrong thing.
 
     Under Docker's userland proxy, ``docker-proxy`` binds and accepts on the
@@ -154,13 +155,24 @@ def _await_ready(endpoint: str, proc: subprocess.Popen, timeout: float = 60.0) -
     not check one. The body is empty, which is a valid empty
     ``ExportMetricsServiceRequest``: the debug exporter renders nothing for it,
     so the probe cannot pollute the pid-keyed marker assertions.
+
+    Both ways of failing quote *log*, the launch log, so a failed image pull or
+    a rejected config says why instead of only that nothing ever answered.
     """
     import httpx
+
+    def tail() -> str:
+        try:
+            text = log.read_text(errors="replace").strip()
+        except OSError:
+            return ""
+        return f"\nLaunch log:\n{text[-2000:]}" if text else ""
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise AssertionError(f"collector exited early with {proc.returncode}")
+            raise AssertionError(
+                f"collector exited early with {proc.returncode}{tail()}")
         try:
             httpx.post(f"{endpoint}/v1/metrics", content=b"",
                        headers={"Content-Type": "application/x-protobuf"},
@@ -168,7 +180,8 @@ def _await_ready(endpoint: str, proc: subprocess.Popen, timeout: float = 60.0) -
             return
         except httpx.HTTPError:
             time.sleep(0.2)
-    raise AssertionError(f"collector never answered on {endpoint} within {timeout}s")
+    raise AssertionError(
+        f"collector never answered on {endpoint} within {timeout}s{tail()}")
 
 
 @pytest.fixture(scope="module")
@@ -206,7 +219,7 @@ def collector(tmp_path_factory):
 
     running = _Collector(proc, port, log, container)
     try:
-        _await_ready(running.endpoint, proc)
+        _await_ready(running.endpoint, proc, log)
         yield running
     finally:
         running.stop()
