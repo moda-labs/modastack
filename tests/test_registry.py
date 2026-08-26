@@ -295,6 +295,37 @@ raise SystemExit(1)
     def test_update_nonexistent_is_noop(self, tmp_registry):
         tmp_registry.update("does-not-exist", status="running")
 
+    def test_update_leaves_no_lock_when_the_entry_vanishes_mid_call(
+            self, tmp_registry, tmp_path):
+        """A no-op update must not leave state.lock in a dying directory.
+
+        `update` re-checks the state file under the lock and returns when the
+        entry has already gone, but it took the lock to get there - creating
+        `state.lock` inside a session directory that a concurrent teardown was
+        removing. `shutil.rmtree` had already scandir'd that directory, so the
+        file it never saw made the final `os.rmdir` raise ENOTEMPTY.
+
+        The vanishing is injected in exactly the window the inner re-check
+        guards: after `update` saw the file, before it holds the lock.
+        """
+        tmp_registry.register(SessionEntry(name="agent-1", status="running"))
+        session_dir = tmp_path / "state" / "sessions" / "agent-1"
+        state_path = session_dir / "state.json"
+        real_lock = sdk._state_file_lock
+
+        @contextmanager
+        def vanish_then_lock(path):
+            path.unlink(missing_ok=True)
+            with real_lock(path):
+                yield
+
+        with patch.object(sdk, "_state_file_lock", vanish_then_lock):
+            tmp_registry.update("agent-1", status="done")
+
+        assert not state_path.exists()
+        leftover = sorted(p.name for p in session_dir.iterdir())
+        assert leftover == [], f"update left files behind: {leftover}"
+
     def test_mark_done_keeps_entry(self, tmp_registry):
         tmp_registry.register(SessionEntry(name="agent-1", status="running"))
         tmp_registry.mark_done("agent-1")
