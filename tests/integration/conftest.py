@@ -460,8 +460,12 @@ def _drop_session(name):
     writing into its session directory when the test that launched it cleans
     up. Removing first raced that writer and raised ``OSError: [Errno 39]
     Directory not empty`` on roughly 3% of CI runs; killing the writer removes
-    the race outright instead of narrowing it, and closes the orphaned-node
-    leak the CI runner used to clean up after every run.
+    the race outright instead of narrowing it.
+
+    It does NOT close the suite's orphaned-node leak. The CI runner still
+    terminates the same 5 orphan ``node`` processes after this change, so those
+    come from launches that never reach this fixture, not from the sessions it
+    drops. Measured on the run for PR #1076, not assumed.
 
     The registry is resolved per call, never cached: the bound root is pinned
     per test, so a registry captured at fixture setup would outlive its env.
