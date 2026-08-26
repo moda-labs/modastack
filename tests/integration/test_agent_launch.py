@@ -9,8 +9,12 @@ the Claude leg exercises a real subagent locally - the same stub the private
 sidecar e2e uses.
 """
 
+import contextlib
 import json
 import os
+import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -197,6 +201,106 @@ class TestUnkeyedLaunchDedup:
     # concurrency semaphore rather than dedup and fails on a loaded box for a
     # reason unrelated to what it claims. It is pinned deterministically at
     # tests/test_subagent.py::TestLaunchAgentUnkeyedDedup instead.
+
+
+@pytest.mark.timeout(120)
+class TestSessionCleanupReapsBeforeRemoving:
+    """The suite's own teardown must not race a live agent.
+
+    ``_drop_session`` used to ``rmtree`` a session directory milliseconds after
+    a detached launch returned, while the agent was still writing into it:
+    ``OSError: [Errno 39] Directory not empty``, on roughly 3% of CI runs and
+    twice red on main this month. The claim is about the PROCESS, so this
+    asserts the group is gone rather than looping a launch until a flake stops
+    reproducing.
+    """
+
+    # A stand-in for a detached agent, with the launch path's topology.
+    # `launcher` starts `leader` in its own session (as `_launch_detached`
+    # does) and exits, so the leader is reparented exactly as a real agent is
+    # once the `bobi` CLI returns, and is never this process's child. `leader`
+    # then starts a child of its own, as an agent starts its node processes.
+    # Both write into the session directory continuously, so a teardown that
+    # removes without reaping meets the same ENOTEMPTY CI did.
+    STUB_AGENT = """\
+import os
+import subprocess
+import sys
+import time
+
+session_dir, mode = sys.argv[1], sys.argv[2]
+if mode == "launcher":
+    subprocess.Popen([sys.executable, __file__, session_dir, "leader"],
+                     start_new_session=True)
+    raise SystemExit(0)
+if mode == "leader":
+    subprocess.Popen([sys.executable, __file__, session_dir, "child"])
+probe = os.path.join(session_dir, "%s-%d.probe" % (mode, os.getpid()))
+while True:
+    with open(probe, "w") as handle:
+        handle.write("x")
+    time.sleep(0.005)
+"""
+
+    @staticmethod
+    def _await_writers(session_dir, timeout=30.0):
+        """Block until leader AND child are both writing into *session_dir*.
+
+        Non-vacuity gate: a teardown that reaps nothing proves nothing unless
+        there was something live to reap.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = {}
+            for probe in session_dir.glob("*.probe"):
+                mode, _, pid = probe.stem.rpartition("-")
+                found[mode] = int(pid)
+            if {"leader", "child"} <= found.keys():
+                return found
+            time.sleep(0.05)
+        raise AssertionError(
+            f"stub agent never wrote into {session_dir}: "
+            f"{sorted(p.name for p in session_dir.iterdir())}"
+        )
+
+    def test_drop_session_reaps_the_group_before_removing_the_directory(
+        self, stub_bobi_env, tmp_path
+    ):
+        from bobi.sdk import SessionEntry, get_registry
+
+        from .conftest import _drop_session
+
+        registry = get_registry()
+        name = "wf-adhoc-test-repo-reap-probe"
+        registry.register(SessionEntry(name=name, role="engineer",
+                                       status="running"))
+        session_dir = registry.session_dir(name)
+
+        script = tmp_path / "stub_agent.py"
+        script.write_text(self.STUB_AGENT)
+        subprocess.run(
+            [sys.executable, str(script), str(session_dir), "launcher"],
+            check=True, timeout=30,
+        )
+        writers = self._await_writers(session_dir)
+        registry.update(name, pid=writers["leader"])
+
+        try:
+            _drop_session(name)
+        finally:
+            # Never leave the stand-in spinning, even on a failed assertion.
+            with contextlib.suppress(OSError):
+                os.killpg(writers["leader"], signal.SIGKILL)
+
+        # The load-bearing assertion: by the time _drop_session returns, the
+        # whole group is gone - leader and its child, not just the pid the
+        # registry knew about. Signal 0 to an empty group is ESRCH.
+        with pytest.raises(ProcessLookupError):
+            os.killpg(writers["leader"], 0)
+        assert not session_dir.exists(), (
+            "the session directory survived teardown: "
+            f"{sorted(p.name for p in session_dir.iterdir())}"
+        )
 
 
 @pytest.mark.timeout(240)

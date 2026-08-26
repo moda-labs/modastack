@@ -22,7 +22,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -141,17 +140,35 @@ class _Collector:
             self.proc.kill()
 
 
-def _await_listening(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> None:
+def _await_ready(endpoint: str, proc: subprocess.Popen, timeout: float = 60.0) -> None:
+    """Ready = the OTLP receiver ANSWERS. A TCP connect proves the wrong thing.
+
+    Under Docker's userland proxy, ``docker-proxy`` binds and accepts on the
+    published host port as soon as the container is created, before otelcol
+    binds 4318 inside it. A ``connect_ex`` probe therefore succeeds while the
+    receiver is still down, the proxy's dial into the container fails, and the
+    POST the test has already written comes back as ``[Errno 104] Connection
+    reset by peer``.
+
+    Any HTTP status answers the only question that matters, so the probe does
+    not check one. The body is empty, which is a valid empty
+    ``ExportMetricsServiceRequest``: the debug exporter renders nothing for it,
+    so the probe cannot pollute the pid-keyed marker assertions.
+    """
+    import httpx
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise AssertionError(f"collector exited early with {proc.returncode}")
-        with socket.socket() as s:
-            s.settimeout(0.5)
-            if s.connect_ex(("127.0.0.1", port)) == 0:
-                return
-        time.sleep(0.2)
-    raise AssertionError(f"collector did not listen on {port} within {timeout}s")
+        try:
+            httpx.post(f"{endpoint}/v1/metrics", content=b"",
+                       headers={"Content-Type": "application/x-protobuf"},
+                       timeout=2.0)
+            return
+        except httpx.HTTPError:
+            time.sleep(0.2)
+    raise AssertionError(f"collector never answered on {endpoint} within {timeout}s")
 
 
 @pytest.fixture(scope="module")
@@ -175,17 +192,21 @@ def collector(tmp_path_factory):
         config.write_text(CONFIG.format(port=4318))
         config.chmod(0o644)
         container = f"bobi-otel-test-{port}"
+        # Same log file as the binary path. DEVNULL here made a failed image
+        # pull or a rejected config invisible: the test could only report that
+        # nothing ever answered, never why.
+        handle = log.open("w")
         proc = subprocess.Popen(
             ["docker", "run", "--rm", "--name", container,
              "-p", f"127.0.0.1:{port}:4318",
              "-v", f"{config}:/etc/otelcol/config.yaml:ro",
              COLLECTOR_IMAGE, "--config", "/etc/otelcol/config.yaml"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=handle, stderr=subprocess.STDOUT,
         )
 
     running = _Collector(proc, port, log, container)
     try:
-        _await_listening(port, proc)
+        _await_ready(running.endpoint, proc)
         yield running
     finally:
         running.stop()

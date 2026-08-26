@@ -145,7 +145,16 @@ def _pid_file_alive(pid_path: Path) -> bool:
 
 @contextmanager
 def _state_file_lock(path: Path) -> Iterator[None]:
-    """Serialize whole-document state changes across processes."""
+    """Serialize whole-document state changes across processes.
+
+    The lock is held only while the document it guards exists. Every writer
+    here re-checks *path* under the lock and no-ops when the entry has already
+    vanished, so on that path the lock file is the only thing the call would
+    leave behind - inside a session directory that is being removed. A file
+    created after ``shutil.rmtree`` has scandir'd the directory makes the
+    final ``os.rmdir`` raise ``ENOTEMPTY``, so unlink it while still holding
+    it: nothing can be mid-write on a document that is already gone.
+    """
     lock_path = path.with_suffix(".lock")
     with open(lock_path, "a+") as lock_file:
         import fcntl
@@ -154,6 +163,8 @@ def _state_file_lock(path: Path) -> Iterator[None]:
         try:
             yield
         finally:
+            if not path.exists():
+                lock_path.unlink(missing_ok=True)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
