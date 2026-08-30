@@ -24,7 +24,10 @@ dependencies = [
     "pyyaml>=6.0",
     "click>=8.1",
     "truststore>=0.9",
-    "websocket-client>=1.7",
+    # 1.9.1 re-reads self.sock after closing it in WebSocketApp.close(), which
+    # races the run_forever() reader thread nulling it out in teardown() and
+    # raises AttributeError on close_frame. Skip that one release; see #1079.
+    "websocket-client>=1.7,!=1.9.1",
     "certifi>=2024.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
